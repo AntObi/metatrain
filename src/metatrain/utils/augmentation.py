@@ -129,12 +129,10 @@ def _tensor_system_ids(tensor: TensorMap, n_systems: int) -> Optional[torch.Tens
     systems in this batch, in the same order as the ``systems`` list, as used by
     this specific tensor.
 
-    The "system" sample label is normally the absolute dataset index of each system
-    (see ``dataset.py``), but some collate transforms (e.g. atomic-basis target
-    preparation) reindex it to a batch-local ``0..n_systems-1`` before augmentation
-    runs. Different tensors in the same batch can therefore use different "system"
-    numbering, so the mapping must be recovered independently for each tensor rather
-    than shared across the whole batch.
+    Collation assigns batch-local occurrence ids, including for repeated records.
+    Direct callers can also pass source-numbered labels. Recover their mapping in
+    first-appearance order independently for each tensor. If no block covers all
+    systems, the transformation uses the batch-local numbering directly.
 
     :param tensor: the tensor to recover the per-system "system" label values from.
     :param n_systems: the number of systems in the batch.

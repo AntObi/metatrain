@@ -679,6 +679,12 @@ def get_prepare_atomic_basis_targets_transform(
     Get a function that prepares the atomic basis targets for batching by densifying and
     padding.
 
+    The ``system`` sample column of ``mtt::aux::system_index`` identifies the systems
+    in list order and must agree with the target and extra-data sample labels.
+    Collation makes these labels batch-local occurrence ids while preserving the
+    auxiliary values as dataset-local source indices. Direct callers can also use
+    matching source-numbered labels.
+
     :param pre_dataset_info: DatasetInfo before the transform, specifying what is the
         layout of the targets that the transform will receive.
     :param post_dataset_info: DatasetInfo after the transform, specifying what is the
@@ -732,7 +738,10 @@ def get_prepare_atomic_basis_targets_transform(
         """
         Transform function that prepares the atomic basis targets for batching by
         densifying and padding, modifying in-place. Samples keep the tensor's own
-        native "system" ids throughout.
+        native "system" ids throughout. The auxiliary system-index sample labels
+        must match the target/extra labels in system-list order. After collation these
+        are batch-local occurrence ids; auxiliary values retain dataset source indices.
+        Direct callers may use source-numbered labels if both tensors agree.
 
         :param systems: List of systems.
         :param targets: Dictionary containing the targets corresponding to the systems.
@@ -750,7 +759,7 @@ def get_prepare_atomic_basis_targets_transform(
                     )
                 system_ids = (
                     extra["mtt::aux::system_index"][0]
-                    .values[:, 0]
+                    .samples.column("system")
                     .to(dtype=torch.int64)
                 )
 
@@ -774,7 +783,7 @@ def get_prepare_atomic_basis_targets_transform(
                     )
                 system_ids = (
                     extra["mtt::aux::system_index"][0]
-                    .values[:, 0]
+                    .samples.column("system")
                     .to(dtype=torch.int64)
                 )
 

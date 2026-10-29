@@ -1647,3 +1647,232 @@ def test_disk_dataset_collate_occurrences(tmp_path, fields, indices):
         for record, snapshot in zip(records, snapshots, strict=True):
             for name, tensor in snapshot.items():
                 mts.equal_raise(record[name], tensor)
+
+
+@pytest.mark.parametrize(
+    "overlapping_sources,on_disk", [(False, False), (True, False), (True, True)]
+)
+def test_collate_dataset_occurrences(tmp_path, overlapping_sources, on_disk):
+    """Different datasets can use the same source index without sharing identity."""
+    systems = [
+        System(
+            types=torch.tensor([1, 1]),
+            positions=torch.full((2, 3), float(i), dtype=torch.float64),
+            cell=torch.zeros(3, 3, dtype=torch.float64),
+            pbc=torch.zeros(3, dtype=torch.bool),
+        )
+        for i in range(2)
+    ]
+    source_ids = [0, 0] if overlapping_sources else [7, 2]
+    fields = {"energy": [], "atomic": [], "mtt::aux::system_index": []}
+    for i, source_id in enumerate(source_ids):
+        for name, values, samples in [
+            ("energy", [[10.0 + i]], [[source_id]]),
+            (
+                "atomic",
+                [[100.0 * i], [100.0 * i + 1]],
+                [[source_id, 0], [source_id, 1]],
+            ),
+            ("mtt::aux::system_index", [[float(source_id)]], [[source_id]]),
+        ]:
+            fields[name].append(
+                TensorMap(
+                    Labels.single(),
+                    [
+                        TensorBlock(
+                            values=torch.tensor(values, dtype=torch.float64),
+                            samples=Labels(
+                                ["system", "atom"] if name == "atomic" else ["system"],
+                                torch.tensor(samples),
+                            ),
+                            components=[],
+                            properties=Labels.single(),
+                        )
+                    ],
+                )
+            )
+    if overlapping_sources:
+        datasets = [
+            Dataset.from_dict(
+                {"system": [systems[i]], **{k: [v[i]] for k, v in fields.items()}}
+            )
+            for i in range(2)
+        ]
+        if on_disk:
+            for i in range(len(datasets)):
+                writer = DiskDatasetWriter(tmp_path / f"source-{i}.zip")
+                writer.write(
+                    [systems[i]],
+                    {
+                        k: v[i]
+                        for k, v in fields.items()
+                        if k != "mtt::aux::system_index"
+                    },
+                )
+                writer.finish()
+            datasets = [DiskDataset(tmp_path / f"source-{i}.zip") for i in range(2)]
+        records = [datasets[i][0] for i in [1, 0, 1]]
+    else:
+        dataset = Dataset.from_dict({"system": systems, **fields})
+        records = [dataset[i] for i in [1, 0, 1]]
+    snapshots = [
+        {k: v.copy() for k, v in record._asdict().items() if k != "system"}
+        for record in records
+    ]
+    for _ in range(2):
+        batch_systems, targets, extra = unpack_batch(CollateFn(["energy"])(records))
+        assert [system.positions[0, 0].item() for system in batch_systems] == [1, 0, 1]
+        assert targets["energy"].block().samples.values.tolist() == [[0], [1], [2]]
+        assert targets["energy"].block().values.tolist() == [[11], [10], [11]]
+        assert extra["atomic"].block().samples.values.tolist() == [
+            [0, 0],
+            [0, 1],
+            [1, 0],
+            [1, 1],
+            [2, 0],
+            [2, 1],
+        ]
+        assert extra["atomic"].block().values[:, 0].tolist() == [
+            100,
+            101,
+            0,
+            1,
+            100,
+            101,
+        ]
+        aux = extra["mtt::aux::system_index"].block()
+        assert aux.samples.values.tolist() == [[0], [1], [2]]
+        assert aux.values[:, 0].tolist() == [source_ids[i] for i in [1, 0, 1]]
+        for record, snapshot in zip(records, snapshots, strict=True):
+            for name, tensor in snapshot.items():
+                mts.equal_raise(record[name], tensor)
+
+
+def test_rebase_sparse_blocks_and_gradients():
+    from metatrain.utils.data.dataset import _rebase_system_samples
+
+    def block(system_ids):
+        return TensorBlock(
+            values=torch.arange(len(system_ids), dtype=torch.float64).reshape(-1, 1),
+            samples=Labels(
+                "system", torch.tensor(system_ids, dtype=torch.int32).reshape(-1, 1)
+            ),
+            components=[],
+            properties=Labels.single(),
+        )
+
+    # Empty keys/blocks are legitimate in sparse fields.
+    sparse = TensorMap(
+        Labels("key", torch.tensor([[2], [9]])), [block([]), block([42])]
+    )
+    snapshot = sparse.copy()
+    rebased = _rebase_system_samples(sparse, 3)
+    assert rebased.keys == sparse.keys
+    assert rebased.block(0).samples.values.shape == (0, 1)
+    assert rebased.block(1).samples.values.tolist() == [[3]]
+    mts.equal_raise(sparse, snapshot)
+    empty = TensorMap(Labels("key", torch.empty((0, 1), dtype=torch.int32)), [])
+    mts.equal_raise(_rebase_system_samples(empty, 3), empty)
+
+    # Multiple source systems are rejected even when split across sparse keys.
+    for tensor in [
+        TensorMap(Labels.single(), [block([1, 2])]),
+        TensorMap(Labels("key", torch.tensor([[2], [9]])), [block([1]), block([2])]),
+    ]:
+        with pytest.raises(
+            ValueError, match="single-record field contains multiple system ids"
+        ):
+            _rebase_system_samples(tensor, 0)
+
+    # A map without a system dimension follows the existing join path.
+    no_system = TensorMap(
+        Labels.single(),
+        [
+            TensorBlock(
+                values=torch.ones(1, 1),
+                samples=Labels.range("atom", 1),
+                components=[],
+                properties=Labels.single(),
+            )
+        ],
+    )
+    mts.equal_raise(_rebase_system_samples(no_system, 3), no_system)
+
+    # Gradients without an explicit system column retain parent-row references.
+    parent = block([42])
+    parent.add_gradient(
+        "custom",
+        TensorBlock(
+            values=torch.ones(1, 1, dtype=torch.float64),
+            samples=Labels("sample", torch.tensor([[0]])),
+            components=[],
+            properties=parent.properties,
+        ),
+    )
+    tensor = TensorMap(Labels.single(), [parent])
+    snapshot = tensor.copy()
+    rebased = _rebase_system_samples(tensor, 3)
+    assert rebased.block().samples.values.tolist() == [[3]]
+    mts.equal_raise(tensor, snapshot)
+    assert rebased.block().gradient("custom").samples.values.tolist() == [[0]]
+
+
+def test_collate_sparse_keys_and_nontrivial_gradient_references():
+    """Joins offset local parent rows even for repeated records and sparse keys."""
+    systems = [
+        System(
+            types=torch.tensor([1, 1]),
+            positions=torch.zeros(2, 3, dtype=torch.float64),
+            cell=torch.zeros(3, 3, dtype=torch.float64),
+            pbc=torch.zeros(3, dtype=torch.bool),
+        )
+        for _ in range(2)
+    ]
+    fields = []
+    for source in range(2):
+        block = TensorBlock(
+            values=torch.tensor(
+                [[source * 10.0], [source * 10.0 + 1]], dtype=torch.float64
+            ),
+            samples=Labels(
+                ["system", "atom"], torch.tensor([[source, 0], [source, 1]])
+            ),
+            components=[],
+            properties=Labels.single(),
+        )
+        block.add_gradient(
+            "positions",
+            TensorBlock(
+                values=torch.arange(6, dtype=torch.float64).reshape(2, 3, 1)
+                + source * 100,
+                samples=Labels(
+                    ["sample", "system", "atom"],
+                    torch.tensor([[1, source, 0], [0, source, 1]]),
+                ),
+                components=[Labels.range("xyz", 3)],
+                properties=block.properties,
+            ),
+        )
+        fields.append(TensorMap(Labels("key", torch.tensor([[source + 2]])), [block]))
+    dataset = Dataset.from_dict({"system": systems, "target": fields})
+    snapshots = [tensor.copy() for tensor in fields]
+    _, targets, _ = unpack_batch(CollateFn(["target"])([dataset[i] for i in [1, 0, 1]]))
+    joined = targets["target"]
+    block = joined.block({"key": 3})
+    assert block.samples.values.tolist() == [[0, 0], [0, 1], [2, 0], [2, 1]]
+    assert block.values[:, 0].tolist() == [10, 11, 10, 11]
+    gradient = block.gradient("positions")
+    assert gradient.samples.values.tolist() == [
+        [1, 0, 0],
+        [0, 0, 1],
+        [3, 2, 0],
+        [2, 2, 1],
+    ]
+    torch.testing.assert_close(
+        gradient.values, torch.cat([fields[1].block().gradient("positions").values] * 2)
+    )
+    block = joined.block({"key": 2})
+    assert block.samples.values.tolist() == [[1, 0], [1, 1]]
+    assert block.gradient("positions").samples.values.tolist() == [[1, 1, 0], [0, 1, 1]]
+    for tensor, snapshot in zip(fields, snapshots, strict=True):
+        mts.equal_raise(tensor, snapshot)

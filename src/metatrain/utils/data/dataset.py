@@ -408,7 +408,79 @@ def get_all_targets(datasets: Union[Dataset, List[Dataset]]) -> List[str]:
     return sorted(set(target_names))
 
 
+def _rebase_system_samples(tensor: TensorMap, system_index: int) -> TensorMap:
+    """Assign a single-record field to a batch occurrence without changing its data.
+
+    Explicit gradient system labels are rebased too; gradient ``sample`` references
+    stay local to the parent block until joining offsets them.
+
+    :param tensor: A TensorMap belonging to one dataset record.
+    :param system_index: The batch-local occurrence index.
+    :return: A TensorMap with rebased system sample labels.
+    """
+    if not any(
+        "system" in block.samples.names
+        or any("system" in gradient.samples.names for _, gradient in block.gradients())
+        for block in tensor.blocks()
+    ):
+        return tensor
+
+    source_ids = {
+        value
+        for block in tensor.blocks()
+        if "system" in block.samples.names
+        for value in block.samples.column("system").tolist()
+    }
+    if len(source_ids) > 1:
+        raise ValueError(
+            f"A single-record field contains multiple system ids: {sorted(source_ids)}"
+        )
+    blocks = []
+    for block in tensor.blocks():
+        samples = block.samples
+        if "system" in samples.names:
+            column = samples.names.index("system")
+            sample_values = samples.values.clone()
+            sample_values[:, column] = system_index
+            samples = Labels(samples.names, sample_values)
+        new_block = TensorBlock(
+            values=block.values,
+            samples=samples,
+            components=block.components,
+            properties=block.properties,
+        )
+        for parameter, gradient in block.gradients():
+            samples = gradient.samples
+            if "system" in samples.names:
+                column = samples.names.index("system")
+                sample_values = samples.values.clone()
+                sample_values[:, column] = system_index
+                samples = Labels(samples.names, sample_values)
+            new_block.add_gradient(
+                parameter,
+                TensorBlock(
+                    values=gradient.values,
+                    samples=samples,
+                    components=gradient.components,
+                    properties=gradient.properties,
+                ),
+            )
+        blocks.append(new_block)
+    return TensorMap(tensor.keys, blocks)
+
+
 class CollateFn:
+    """Collate records using batch-local ``system`` sample labels.
+
+    Every occurrence receives its position in the batch, including repeated records.
+    Values are preserved: ``mtt::aux::system_index`` values remain dataset-local
+    source indices, which are not globally unique across datasets.
+
+    :param target_keys: Names of the fields treated as targets.
+    :param callables: Transforms applied to the joined systems, targets and extras.
+    :param join_kwargs: Keyword arguments forwarded to ``group_and_join``.
+    """
+
     def __init__(
         self,
         target_keys: List[str],
@@ -423,7 +495,7 @@ class CollateFn:
 
     def __call__(
         self,
-        batch: List[Dict[str, Any]],
+        batch: List[NamedTuple],
     ) -> Tuple[torch.Tensor, List[int], List[str], List[int], List[str], List[int]]:
         """
         :param batch: A batch
@@ -435,8 +507,19 @@ class CollateFn:
             - a list with the names of each extra data
             - a list with the sizes of each extra data buffer
         """
-        # group & join
-        collated = group_and_join(batch, join_kwargs=self.join_kwargs)
+        # Rebase each occurrence before joining, including targets and extra data.
+        records = [
+            sample._replace(
+                **{
+                    name: _rebase_system_samples(value, i)
+                    for name, value in sample._asdict().items()
+                    if isinstance(value, torch.ScriptObject)
+                    and value._type().name() == "TensorMap"
+                }
+            )
+            for i, sample in enumerate(batch)
+        ]
+        collated = group_and_join(records, join_kwargs=self.join_kwargs)
         data = collated._asdict()
 
         # pull off systems

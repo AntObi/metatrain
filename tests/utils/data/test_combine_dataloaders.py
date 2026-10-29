@@ -107,6 +107,7 @@ def test_with_shuffling():
         }
     }
     targets, target_info_dict = read_targets(OmegaConf.create(conf))
+    qm9_reference = [tensor.block().values.item() for tensor in targets["mtt::U0"]]
     dataset = Dataset.from_dict({"system": systems, "mtt::U0": targets["mtt::U0"]})
     collate_fn = CollateFn(target_info_dict)
     dataloader_qm9 = DataLoader(
@@ -133,6 +134,9 @@ def test_with_shuffling():
     }
     targets, target_info_dict = read_targets(OmegaConf.create(conf))
     targets = {"mtt::free_energy": targets["mtt::free_energy"][:10]}
+    alchemical_reference = [
+        tensor.block().values.item() for tensor in targets["mtt::free_energy"]
+    ]
     dataset = Dataset.from_dict(
         {"system": systems, "mtt::free_energy": targets["mtt::free_energy"]}
     )
@@ -152,8 +156,8 @@ def test_with_shuffling():
     alchemical_batch_count = 0
     original_ordering = ["qm9"] * 10 + ["alchemical"] * 5
     actual_ordering = []
-    qm9_samples = []
-    alchemical_samples = []
+    qm9_values = []
+    alchemical_values = []
 
     for batch in combined_dataloader:
         batch = unpack_batch(batch)
@@ -161,22 +165,21 @@ def test_with_shuffling():
             qm9_batch_count += 1
             assert batch[1]["mtt::U0"].block().values.shape == (10, 1)
             actual_ordering.append("qm9")
-            qm9_samples.append(batch[1]["mtt::U0"].block().samples.column("system"))
+            block = batch[1]["mtt::U0"].block()
+            assert block.samples.column("system").tolist() == list(range(10))
+            qm9_values.extend(block.values[:, 0].tolist())
         else:
             alchemical_batch_count += 1
             assert batch[1]["mtt::free_energy"].block().values.shape == (2, 1)
             actual_ordering.append("alchemical")
-            alchemical_samples.append(
-                batch[1]["mtt::free_energy"].block().samples.column("system")
-            )
+            block = batch[1]["mtt::free_energy"].block()
+            assert block.samples.column("system").tolist() == list(range(2))
+            alchemical_values.extend(block.values[:, 0].tolist())
 
     assert qm9_batch_count == 10
     assert alchemical_batch_count == 5
     assert actual_ordering != original_ordering
 
-    qm9_samples = [int(item) for sublist in qm9_samples for item in sublist]
-    alchemical_samples = [
-        int(item) for sublist in alchemical_samples for item in sublist
-    ]
-    assert set(qm9_samples) == set(range(100))
-    assert set(alchemical_samples) == set(range(10))
+    # Batch labels restart at zero; source coverage is checked through the data.
+    assert sorted(qm9_values) == sorted(qm9_reference)
+    assert sorted(alchemical_values) == sorted(alchemical_reference)

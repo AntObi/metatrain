@@ -4,7 +4,14 @@ import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import System
 
-from metatrain.utils.data import DatasetInfo
+from metatrain.utils.augmentation import O3Augmenter
+from metatrain.utils.data import (
+    CollateFn,
+    Dataset,
+    DatasetInfo,
+    DiskDataset,
+    unpack_batch,
+)
 from metatrain.utils.data.atomic_basis_helpers import (
     densify_atomic_basis_dataset_info,
     densify_atomic_basis_target,
@@ -14,6 +21,7 @@ from metatrain.utils.data.atomic_basis_helpers import (
     sparsify_atomic_basis_target,
 )
 from metatrain.utils.data.target_info import TargetInfo
+from metatrain.utils.data.writers import DiskDatasetWriter
 
 
 # ---------------------------------------------------------------------------
@@ -502,14 +510,10 @@ def test_prepare_atomic_basis_targets_nontrivial_system_ids():
 
 def test_get_prepare_atomic_basis_targets_transform_batch_from_larger_dataset():
     """
-    ``get_prepare_atomic_basis_targets_transform`` is the actual function every
-    trainer's collate function uses. This simulates a batch of 2 drawn from a larger
-    dataset (absolute, non-adjacent "system" ids 1 and 3), built the way
-    ``metatensor_learn``'s ``group_and_join`` does: joining per-system tensors while
-    preserving each system's true absolute dataset index (not renumbering to 0, 1).
-
-    A round trip through ``transform`` then ``reverse_transform`` must recover the
-    original per-system data exactly.
+    Direct transform callers may use non-adjacent source-numbered labels instead
+    of going through collation. Auxiliary labels must match the target labels;
+    auxiliary values need not match either (and are never used for alignment).
+    A preparation/reverse round trip must recover the original tensor exactly.
     """
     system_ids = torch.tensor([1, 3])
     layout = _make_layout_coupled_per_atom()
@@ -523,7 +527,7 @@ def test_get_prepare_atomic_basis_targets_transform_batch_from_larger_dataset():
         keys=Labels(names=["_"], values=torch.tensor([[0]])),
         blocks=[
             TensorBlock(
-                values=system_ids.reshape(-1, 1).to(torch.float64),
+                values=torch.tensor([[99.0], [88.0]], dtype=torch.float64),
                 samples=Labels(names=["system"], values=system_ids.reshape(-1, 1)),
                 components=[],
                 properties=Labels(names=["_"], values=torch.tensor([[0]])),
@@ -549,3 +553,110 @@ def test_get_prepare_atomic_basis_targets_transform_batch_from_larger_dataset():
 
     _, recovered, _ = reverse_transform(systems, prepared, {})
     mts.allclose_raise(recovered["target"], sparse, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("as_extra", [False, True])
+@pytest.mark.parametrize("on_disk", [False, True])
+def test_atomic_basis_collate_repeated_occurrences(tmp_path, as_extra, on_disk):
+    """Densification, augmentation and sparsification keep three aligned occurrences."""
+    systems = _make_systems()
+    sparse = _make_sparse_tensor()
+    layout = _make_layout_coupled_per_atom()
+    info = TargetInfo(layout=layout)
+    pre_info = DatasetInfo(
+        length_unit="angstrom",
+        atomic_types=[1, 6],
+        targets={} if as_extra else {"target": info},
+        extra_data={"target": info} if as_extra else {},
+    )
+    dense_info = TargetInfo(layout=densify_atomic_basis_target(layout, layout))
+    post_info = DatasetInfo(
+        length_unit="angstrom",
+        atomic_types=[1, 6],
+        targets={} if as_extra else {"target": dense_info},
+        extra_data={"target": dense_info} if as_extra else {},
+    )
+    transform, reverse = get_prepare_atomic_basis_targets_transform(pre_info, post_info)
+    per_system = [
+        mts.slice(sparse, "samples", Labels("system", torch.tensor([[i]])))
+        for i in range(2)
+    ]
+    if on_disk:
+        writer = DiskDatasetWriter(tmp_path / "basis.zip")
+        for system, tensor in zip(systems, per_system, strict=True):
+            writer.write([system], {"target": tensor})
+        writer.finish()
+        dataset = DiskDataset(tmp_path / "basis.zip")
+    else:
+        aux = [
+            TensorMap(
+                Labels.single(),
+                [
+                    TensorBlock(
+                        values=torch.tensor([[float(i)]], dtype=torch.float64),
+                        samples=Labels("system", torch.tensor([[i]])),
+                        components=[],
+                        properties=Labels.single(),
+                    )
+                ],
+            )
+            for i in range(2)
+        ]
+        dataset = Dataset.from_dict(
+            {"system": systems, "target": per_system, "mtt::aux::system_index": aux}
+        )
+    records = [dataset[i] for i in [1, 0, 1]]
+    target_keys = [] if as_extra else ["target"]
+    _, raw_targets, raw_extra = unpack_batch(CollateFn(target_keys)(records))
+    prepared_systems, prepared_targets, prepared_extra = unpack_batch(
+        CollateFn(target_keys, callables=[transform])(records)
+    )
+    expected_samples = get_per_atom_sample_labels(prepared_systems, torch.arange(3))
+    prepared = prepared_extra["target"] if as_extra else prepared_targets["target"]
+    for block in prepared.blocks():
+        assert block.samples == expected_samples
+    assert prepared_extra["mtt::aux::system_index"].block().values[:, 0].tolist() == [
+        1,
+        0,
+        1,
+    ]
+    _, recovered_targets, recovered_extra = reverse(
+        prepared_systems, prepared_targets.copy(), prepared_extra.copy()
+    )
+    recovered = recovered_extra["target"] if as_extra else recovered_targets["target"]
+    raw = raw_extra["target"] if as_extra else raw_targets["target"]
+    mts.equal_raise(recovered, raw)
+
+    # Give each occurrence a controlled transformation (including an inversion).
+    matrices = [
+        torch.eye(3, dtype=torch.float64),
+        -torch.eye(3, dtype=torch.float64),
+        torch.diag(torch.tensor([-1.0, -1.0, 1.0], dtype=torch.float64)),
+    ]
+    augmenter = O3Augmenter(post_info.targets, post_info.extra_data)
+    rotated_systems, rotated_targets, rotated_extra = augmenter.apply_augmentations(
+        prepared_systems, prepared_targets, matrices, prepared_extra
+    )
+    _, rotated_targets, rotated_extra = reverse(
+        rotated_systems, rotated_targets, rotated_extra
+    )
+    rotated = rotated_extra["target"] if as_extra else rotated_targets["target"]
+    for occurrence, source in enumerate([1, 0, 1]):
+        one_aug = O3Augmenter(pre_info.targets, pre_info.extra_data)
+        _, one_targets, one_extra = one_aug.apply_augmentations(
+            [systems[source]],
+            {} if as_extra else {"target": per_system[source]},
+            [matrices[occurrence]],
+            {"target": per_system[source]} if as_extra else {},
+        )
+        expected = one_extra["target"] if as_extra else one_targets["target"]
+        for key, block in rotated.items():
+            selection = block.samples.column("system") == occurrence
+            expected_block = expected.block(key)
+            torch.testing.assert_close(block.values[selection], expected_block.values)
+    # In particular, the vector channels of occurrences 0 and 2 must differ.
+    vector = rotated.block({"o3_lambda": 1, "o3_sigma": 1, "atom_type": 1})
+    assert not torch.equal(
+        vector.values[vector.samples.column("system") == 0],
+        vector.values[vector.samples.column("system") == 2],
+    )
