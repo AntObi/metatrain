@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
+import metatensor.torch as mts
 import numpy as np
 import pytest
 import torch
@@ -12,6 +13,7 @@ from metatrain.utils.data import (
     CollateFn,
     Dataset,
     DatasetInfo,
+    DiskDataset,
     TargetInfo,
     check_datasets,
     get_all_targets,
@@ -24,7 +26,7 @@ from metatrain.utils.data import (
     unpack_batch,
 )
 from metatrain.utils.data.dataset import MemmapDataset
-from metatrain.utils.data.writers import MemmapWriter
+from metatrain.utils.data.writers import DiskDatasetWriter, MemmapWriter
 
 
 RESOURCES_PATH = Path(__file__).parents[2] / "resources"
@@ -1524,3 +1526,124 @@ def test_dataset_info_merge_incompatible_target_units(
             info.update(other)
         else:
             info.union(other)
+
+
+@pytest.mark.parametrize("fields", [[], ["energy", "atomic", "atomic_extra"]])
+@pytest.mark.parametrize("indices", [[1, 0, 1], [1, 0]])
+def test_disk_dataset_collate_occurrences(tmp_path, fields, indices):
+    """Sample labels identify occurrences; auxiliary values identify source rows."""
+    systems = [
+        System(
+            types=torch.ones(n, dtype=torch.int32),
+            positions=torch.arange(n * 3, dtype=torch.float64).reshape(n, 3) + 10 * i,
+            cell=torch.zeros(3, 3, dtype=torch.float64),
+            pbc=torch.zeros(3, dtype=torch.bool),
+        )
+        for i, n in enumerate([2, 3])
+    ]
+    writer = DiskDatasetWriter(tmp_path / "occurrences.zip")
+    for i, system in enumerate(systems):
+        energy = TensorBlock(
+            values=torch.tensor([[10.0 + i]], dtype=torch.float64),
+            samples=Labels("system", torch.tensor([[i]])),
+            components=[],
+            properties=Labels.range("energy", 1),
+        )
+        energy.add_gradient(
+            "positions",
+            TensorBlock(
+                values=torch.arange(len(system) * 3, dtype=torch.float64).reshape(
+                    -1, 3, 1
+                )
+                + 100 * i,
+                samples=Labels(
+                    ["sample", "system", "atom"],
+                    torch.tensor([[0, i, a] for a in range(len(system))]),
+                ),
+                components=[Labels.range("xyz", 3)],
+                properties=energy.properties,
+            ),
+        )
+        energy.add_gradient(
+            "strain",
+            TensorBlock(
+                values=torch.arange(9, dtype=torch.float64).reshape(1, 3, 3, 1)
+                + 1000 * i,
+                samples=Labels(["sample", "system"], torch.tensor([[0, i]])),
+                components=[Labels.range("xyz_1", 3), Labels.range("xyz_2", 3)],
+                properties=energy.properties,
+            ),
+        )
+        atomic = TensorMap(
+            Labels.single(),
+            [
+                TensorBlock(
+                    values=(
+                        torch.arange(len(system), dtype=torch.float64) + 100 * i
+                    ).reshape(-1, 1),
+                    samples=Labels(
+                        ["atom", "system"],
+                        torch.tensor([[a, i] for a in range(len(system))]),
+                    ),
+                    components=[],
+                    properties=Labels.range("value", 1),
+                )
+            ],
+        )
+        writer.write(
+            [system],
+            {
+                "energy": TensorMap(Labels.single(), [energy]),
+                "atomic": atomic,
+                "atomic_extra": atomic,
+            },
+        )
+    writer.finish()
+    dataset = DiskDataset(tmp_path / "occurrences.zip", fields=fields)
+    records = [dataset[i] for i in indices]
+    snapshots = [
+        {k: v.copy() for k, v in record._asdict().items() if k != "system"}
+        for record in records
+    ]
+    collate = CollateFn(["energy", "atomic"])
+    for _ in range(2):
+        actual_systems, targets, extra = unpack_batch(collate(records))
+        for actual, index in zip(actual_systems, indices, strict=True):
+            torch.testing.assert_close(actual.positions, systems[index].positions)
+        aux = extra["mtt::aux::system_index"].block()
+        assert aux.samples.values.tolist() == [[i] for i in range(len(indices))]
+        assert aux.values.tolist() == [[float(i)] for i in indices]
+        if fields:
+            energy = targets["energy"].block()
+            assert energy.samples.values.tolist() == [[i] for i in range(len(indices))]
+            assert energy.values.tolist() == [[10.0 + i] for i in indices]
+            for name, result in [("atomic", targets), ("atomic_extra", extra)]:
+                block = result[name].block()
+                assert block.samples.values.tolist() == [
+                    [a, occurrence]
+                    for occurrence, i in enumerate(indices)
+                    for a in range(len(systems[i]))
+                ]
+                assert block.values.tolist() == [
+                    [100.0 * i + a] for i in indices for a in range(len(systems[i]))
+                ]
+            for gradient in ["positions", "strain"]:
+                block = energy.gradient(gradient)
+                expected_labels = []
+                for occurrence, i in enumerate(indices):
+                    expected_labels.extend(
+                        [[occurrence, occurrence, a] for a in range(len(systems[i]))]
+                        if gradient == "positions"
+                        else [[occurrence, occurrence]]
+                    )
+                assert block.samples.values.tolist() == expected_labels
+                expected = torch.cat(
+                    [
+                        record["energy"].block().gradient(gradient).values
+                        for record in records
+                    ]
+                )
+                torch.testing.assert_close(block.values, expected)
+        for record, snapshot in zip(records, snapshots, strict=True):
+            for name, tensor in snapshot.items():
+                mts.equal_raise(record[name], tensor)
